@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+/**
+ * SELENA TIKTOK BRIDGE
+ * Terhubung langsung ke TikTok LIVE @kagura.titik lewat tiktok-live-connector,
+ * lalu menyajikan endpoint berformat IndoFinity (/v1/live, /v1/chats) di 127.0.0.1
+ * supaya brain Selena (mao-viewer/brain.js) tetap memakai pollLoop yang sama.
+ * Otomatis mencoba lagi bila akun belum/tidak sedang LIVE atau koneksi terputus.
+ */
+import http from 'node:http';
+import { pathToFileURL } from 'node:url';
+
+const USER = (process.env.TIKTOK_USER || 'kagura.titik').replace(/^@/, '');
+const PORT = Number(process.env.BRIDGE_PORT || 8880);
+const LIB = process.env.TIKTOK_LIB || '/home/agentuser/mao-vtuber-studio/node_modules/tiktok-live-connector/dist/index.js';
+const RETRY_MS = Number(process.env.RETRY_MS || 120000);
+const MAX_CHATS = 50;
+const MAX_JOINS = 50;
+
+const st = { live: false, viewCount: 0, likeCount: 0, state: 'mulai', since: null, chats: 0, lastError: null };
+let chats = [];
+let joins = [];
+const DEBUG = process.env.BRIDGE_DEBUG === '1';
+let sim = false;
+let conn = null, gen = 0, timer = null;
+
+const log = (...a) => console.log(new Date().toTimeString().slice(0, 8), ...a);
+const str = (v, n = 300) => String(v ?? '').replace(/\s+/g, ' ').trim().slice(0, n);
+
+function jadwal(g, alasan, ms = RETRY_MS) {
+  if (g !== gen) return;
+  clearTimeout(timer);
+  st.live = false; st.state = 'menunggu';
+  log(`@${USER}: ${alasan}; coba lagi ${Math.round(ms / 1000)} dtk`);
+  timer = setTimeout(() => sambung(g), ms);
+}
+
+async function sambung(g) {
+  if (g !== gen) return;
+  try {
+    const { TikTokLiveConnection } = await import(pathToFileURL(LIB).href);
+    const c = new TikTokLiveConnection(USER, { processInitialData: false, fetchRoomInfoOnConnect: true, enableExtendedGiftInfo: false });
+    c.on('chat', d => {
+      if (g !== gen) return;
+      const comment = str(d?.comment ?? d?.content);
+      if (!comment) return;
+      const uniqueId = str(d?.user?.uniqueId, 40);
+      const ts = Date.now();
+      const msgId = str(d?.common?.msgId, 64) || str(d?.msgId, 64) || `${uniqueId}-${ts}-${Math.random().toString(36).slice(2, 7)}`;
+      chats.push({ msgId, uniqueId, nickname: str(d?.user?.nickname, 40) || uniqueId, comment, ts });
+      if (chats.length > MAX_CHATS) chats.splice(0, chats.length - MAX_CHATS);
+      st.chats++;
+    });
+    c.on('member', d => {
+      if (g !== gen) return;
+      const uniqueId = str(d?.user?.uniqueId, 40);
+      if (!uniqueId) return;
+      const ts = Date.now();
+      const msgId = str(d?.common?.msgId, 64) || `${uniqueId}-${ts}`;
+      joins.push({ msgId, uniqueId, nickname: str(d?.user?.nickname, 40) || uniqueId, ts });
+      if (joins.length > MAX_JOINS) joins.splice(0, joins.length - MAX_JOINS);
+    });
+    c.on('roomUser', d => { if (g === gen && Number.isFinite(Number(d?.viewerCount))) st.viewCount = Number(d.viewerCount); });
+    c.on('like', d => { if (g === gen && Number.isFinite(Number(d?.totalLikeCount))) st.likeCount = Number(d.totalLikeCount); });
+    c.on('streamEnd', () => { if (g !== gen) return; st.live = false; log(`siaran @${USER} berakhir`); });
+    c.on('disconnected', () => { if (g !== gen) return; conn = null; jadwal(g, 'koneksi terputus', 15000); });
+    c.on('error', () => {});
+    await c.connect();
+    if (g !== gen) { try { c.disconnect(); } catch {} return; }
+    conn = c; st.live = true; st.state = 'terhubung'; st.since = Date.now(); st.lastError = null;
+    log(`terhubung ke LIVE @${USER}`);
+  } catch (e) {
+    st.lastError = str(e?.message, 120);
+    jadwal(g, `belum/tidak sedang LIVE (${st.lastError})`);
+  }
+}
+
+const server = http.createServer((req, res) => {
+  const p = new URL(req.url, 'http://x').pathname;
+  const send = (code, o) => { res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' }); res.end(JSON.stringify(o)); };
+  if (p === '/v1/live') return send(200, { ok: true, data: { live: st.live || sim, viewCount: st.viewCount, likeCount: st.likeCount, username: USER, since: sim ? st.simSince : st.since } });
+  if (p === '/v1/joins') return send(200, { ok: true, data: joins });
+  if (DEBUG && req.method === 'POST' && p.startsWith('/debug/')) {
+    const q = new URL(req.url, 'http://x').searchParams;
+    const ts = Date.now(), name = q.get('name') || 'Tester';
+    if (p === '/debug/sim') { sim = q.get('on') === '1'; st.simSince = ts; return send(200, { ok: true, sim }); }
+    if (p === '/debug/join') { joins.push({ msgId: 'dbg-' + ts, uniqueId: 'dbg_' + name.toLowerCase(), nickname: name, ts }); return send(200, { ok: true }); }
+    if (p === '/debug/chat') { chats.push({ msgId: 'dbg-' + ts, uniqueId: 'dbg_' + name.toLowerCase(), nickname: name, comment: q.get('text') || 'halo', ts }); return send(200, { ok: true }); }
+  }
+  if (p === '/v1/chats') return send(200, { ok: true, data: chats });
+  if (p === '/health') return send(200, { ok: true, username: USER, ...st, buffered: chats.length, joins: joins.length });
+  send(404, { ok: false });
+});
+server.listen(PORT, '127.0.0.1', () => log(`SELENA TIKTOK BRIDGE di 127.0.0.1:${PORT} untuk @${USER}`));
+
+process.on('unhandledRejection', e => log('unhandledRejection', str(e?.message || e, 150)));
+process.on('uncaughtException', e => log('uncaughtException', str(e?.message || e, 150)));
+process.on('SIGINT', () => { gen++; try { conn?.disconnect(); } catch {} process.exit(0); });
+process.on('SIGTERM', () => { gen++; try { conn?.disconnect(); } catch {} process.exit(0); });
+
+sambung(gen);
